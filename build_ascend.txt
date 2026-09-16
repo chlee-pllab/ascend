@@ -1,0 +1,110 @@
+# Ascend CANN conda simulator env + fused_matmul_lib build + HF sim run
+# Full, verified command sequence (CPU-only machine, no physical Ascend NPU).
+
+## 1. Create the conda env and point it at the Ascend conda channel
+
+conda create -n ascend python=3.10 -y
+conda activate ascend
+
+conda config --add channels https://repo.huaweicloud.com/ascend/repos/conda/
+
+## 2. Install CANN toolkit + ops-package first, source the toolkit env,
+##    THEN install cann-nnal in the SAME shell.
+##    (Installing all three in a single `conda install` fails: the nnal
+##    package's post-link script runs the ATB .run installer, which checks
+##    ASCEND_TOOLKIT_HOME before it will proceed. That var only exists after
+##    you source the toolkit's set_env.sh, so nnal must be its own,
+##    later install.)
+
+conda install ascend::cann-toolkit==9.1.0 ascend::cann-910-ops==9.1.0 -y
+source $CONDA_PREFIX/Ascend/ascend-toolkit/set_env.sh
+conda install ascend::cann-nnal==9.1.0 -y
+
+## 3. Source the ATB (nnal) env and set CPU-simulator mode variables.
+##    These four exports/sources are required in EVERY shell you run
+##    Python in for this project — they do not persist across shells.
+
+source $CONDA_PREFIX/Ascend/nnal/atb/set_env.sh
+export ASCEND_SIMULATOR_MODE=1
+export CMAKE_ASC_RUN_MODE=cpu
+export SOC_VERSION=Ascend910B1
+
+## Sanity check the CANN python bindings import correctly:
+python3 -c "import acl; print('CANN Conda simulator environment loaded, target chip:', acl.get_soc_name())"
+# -> prints "target chip: None" here — expected/normal: get_soc_name() queries
+#    a real device driver (no /dev/davinci* on this machine), it does not
+#    read SOC_VERSION. Not a broken install.
+
+## 4. Install the Python ML stack into the SAME conda env.
+##    IMPORTANT: PYTHONNOUSERSITE=1 must be set. Without it, conda does
+##    NOT block your ~/.local/lib/python3.10/site-packages from being
+##    imported ahead of the env's own packages (unlike a venv). This
+##    machine already has a different torch/triton pair installed under
+##    ~/.local, which silently shadows the env's torch_npu install and
+##    makes `import torch_npu` fail deep inside with a confusing error.
+##
+##    This is now handled automatically: env-scoped conda activate/deactivate
+##    hooks were added at
+##      $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh   (exports PYTHONNOUSERSITE=1)
+##      $CONDA_PREFIX/etc/conda/deactivate.d/env_vars.sh (restores previous value)
+##    so `conda activate ascend` alone is enough — no manual export needed,
+##    and no other env or shell is affected. (If setting this up on a fresh
+##    machine, create those two files yourself before pip installing.)
+
+pip install torch==2.6.0
+pip install torch_npu==2.6.0.post5
+pip install transformers accelerate sentencepiece
+
+## Verify:
+python3 -c "import torch_npu, transformers; print('torch_npu', torch_npu.__version__); print('transformers', transformers.__version__)"
+
+## 5. Build the fused_matmul_lib NpuExtension
+##    Note: this torch_npu version's torch_npu.utils.cpp_extension does NOT
+##    export BuildExtension (only NpuExtension) — setup.py pulls
+##    BuildExtension from torch.utils.cpp_extension instead:
+##
+##      from torch_npu.utils.cpp_extension import NpuExtension
+##      from torch.utils.cpp_extension import BuildExtension
+
+cd ~/ascend
+python setup.py build_ext --inplace
+
+## 6. Sanity-test the built op against a manual reference
+##    (matmul_leaky_relu_kernel.cpp implements matmul_activation_forward
+##    via ATen calls — torch::matmul + torch::leaky_relu — not a hand-written
+##    AscendC device kernel, because this machine has no physical NPU and
+##    aclInit() fails here with error 507008 "Failed to obtain the SOC
+##    version"; CANN's CPU simulator mode only covers standalone AscendC
+##    kernel functional testing, not a virtual device for the torch_npu
+##    backend, so there is nothing for a hand-authored device kernel to
+##    execute against.)
+
+python3 -c "
+import torch, fused_matmul_lib
+x = torch.randn(4, 8)
+w = torch.randn(6, 8)
+out = fused_matmul_lib.matmul_activation_forward(x, w)
+ref = torch.nn.functional.leaky_relu(x @ w.t(), negative_slope=0.01)
+print('max abs diff:', (out - ref).abs().max().item())
+print('allclose:', torch.allclose(out, ref))
+"
+# -> max abs diff: 0.0 / allclose: True
+
+## 7. Run the end-to-end HF simulation
+##    (hf_e2e_llm_sim.py was edited: device_map="npu:0" -> "cpu" and
+##    torch.float16 -> torch.float32, since there is no real NPU device
+##    for torch_npu to target here — documented inline in that file.)
+
+python hf_e2e_llm_sim.py
+
+## --- Full one-shot shell sequence for a NEW terminal (env already installed) ---
+# source $(conda info --base)/etc/profile.d/conda.sh
+# conda activate ascend
+# source $CONDA_PREFIX/Ascend/ascend-toolkit/set_env.sh
+# source $CONDA_PREFIX/Ascend/nnal/atb/set_env.sh
+# export ASCEND_SIMULATOR_MODE=1
+# export CMAKE_ASC_RUN_MODE=cpu
+# export SOC_VERSION=Ascend910B1
+# # (PYTHONNOUSERSITE=1 is set automatically by the ascend env's activate.d hook)
+# cd ~/ascend
+# python hf_e2e_llm_sim.py
